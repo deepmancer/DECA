@@ -35,6 +35,35 @@ from .datasets import datasets
 from .utils.config import cfg
 torch.backends.cudnn.benchmark = True
 
+
+def _safe_torch_load(path, map_location=None, **kwargs):
+    """Backward-compatible torch.load with fallbacks for PyTorch ≥2.6."""
+    load_kwargs = dict(kwargs)
+    if map_location is not None:
+        load_kwargs['map_location'] = map_location
+    try:
+        return torch.load(path, weights_only=False, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop('weights_only', None)
+        return torch.load(path, **load_kwargs)
+    except (pickle.UnpicklingError, RuntimeError) as load_err:
+        load_kwargs.setdefault('encoding', 'latin1')
+        load_kwargs.setdefault('pickle_module', pickle)
+        try:
+            return torch.load(path, weights_only=False, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop('weights_only', None)
+        except Exception:
+            pass
+        try:
+            return torch.load(path, **load_kwargs)
+        except Exception as final_err:
+            with open(path, 'rb') as f:
+                head = f.read(64)
+            raise RuntimeError(
+                f"Failed to load checkpoint '{path}'. First 64 bytes: {head!r}"
+            ) from final_err
+
 class DECA(nn.Module):
     def __init__(self, config=None, device='cuda'):
         super(DECA, self).__init__()
@@ -50,8 +79,14 @@ class DECA(nn.Module):
         self._setup_renderer(self.cfg.model)
 
     def _setup_renderer(self, model_cfg):
-        set_rasterizer(self.cfg.rasterizer_type)
-        self.render = SRenderY(self.image_size, obj_filename=model_cfg.topology_path, uv_size=model_cfg.uv_size, rasterizer_type=self.cfg.rasterizer_type).to(self.device)
+        active_rasterizer = set_rasterizer(self.cfg.rasterizer_type)
+        self.render = SRenderY(
+            self.image_size,
+            obj_filename=model_cfg.topology_path,
+            uv_size=model_cfg.uv_size,
+            rasterizer_type=active_rasterizer,
+        ).to(self.device)
+        self.rasterizer_type = self.render.rasterizer_type
         # face mask for rendering details
         mask = imread(model_cfg.face_eye_mask_path).astype(np.float32)/255.; mask = torch.from_numpy(mask[:,:,0])[None,None,:,:].contiguous()
         self.uv_face_eye_mask = F.interpolate(mask, [model_cfg.uv_size, model_cfg.uv_size]).to(self.device)
@@ -86,7 +121,7 @@ class DECA(nn.Module):
         model_path = self.cfg.pretrained_modelpath
         if os.path.exists(model_path):
             print(f'trained model found. load {model_path}')
-            checkpoint = torch.load(model_path)
+            checkpoint = _safe_torch_load(model_path, map_location=self.device)
             self.checkpoint = checkpoint
             util.copy_state_dict(self.E_flame.state_dict(), checkpoint['E_flame'])
             util.copy_state_dict(self.E_detail.state_dict(), checkpoint['E_detail'])
@@ -127,6 +162,46 @@ class DECA(nn.Module):
         uv_detail_normals = uv_detail_normals.reshape([batch_size, uv_coarse_vertices.shape[2], uv_coarse_vertices.shape[3], 3]).permute(0,3,1,2)
         uv_detail_normals = uv_detail_normals*self.uv_face_eye_mask + uv_coarse_normals*(1.-self.uv_face_eye_mask)
         return uv_detail_normals
+
+    def apply_head_pose_lock(self, codedict, freeze_head_pose=False):
+        """Optionally zero out global head orientation before downstream optimization."""
+
+        if not freeze_head_pose:
+            return codedict
+
+        pose = codedict.get('pose')
+        if pose is None:
+            return codedict
+
+        if pose.shape[1] < 3:
+            return codedict
+
+        locked_pose = pose.clone()
+        locked_pose[:, :3] = 0.0
+        codedict['pose'] = locked_pose
+        return codedict
+
+    def export_flame_parameters(self, codedict, squeeze_batch=True):
+        """Return FLAME parameter tensors as numpy arrays for persistence."""
+
+        param_keys = ['shape', 'exp', 'pose', 'cam', 'light']
+        if self.cfg.model.use_tex and 'tex' in codedict:
+            param_keys.append('tex')
+        if 'detail' in codedict:
+            param_keys.append('detail')
+        if 'euler_jaw_pose' in codedict:
+            param_keys.append('euler_jaw_pose')
+
+        params = {}
+        for key in param_keys:
+            tensor = codedict.get(key)
+            if tensor is None:
+                continue
+            array = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+            if squeeze_batch and array.shape[0] == 1:
+                array = array[0]
+            params[key] = array
+        return params
 
     def visofp(self, normals):
         ''' visibility of keypoints, based on the normal direction

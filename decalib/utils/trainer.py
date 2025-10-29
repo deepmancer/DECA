@@ -40,6 +40,25 @@ torch.backends.cudnn.benchmark = True
 from .utils import lossfunc
 from .datasets import build_datasets
 
+
+def _safe_torch_load(path, map_location=None, **kwargs):
+    load_kwargs = dict(kwargs)
+    if map_location is not None:
+        load_kwargs['map_location'] = map_location
+    try:
+        return torch.load(path, weights_only=False, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop('weights_only', None)
+        return torch.load(path, **load_kwargs)
+    except (pickle.UnpicklingError, RuntimeError):
+        load_kwargs.setdefault('encoding', 'latin1')
+        load_kwargs.setdefault('pickle_module', pickle)
+        try:
+            return torch.load(path, weights_only=False, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop('weights_only', None)
+        return torch.load(path, **load_kwargs)
+
 class Trainer(object):
     def __init__(self, model, config=None, device='cuda:0'):
         if config is None:
@@ -79,7 +98,7 @@ class Trainer(object):
         model_dict = self.deca.model_dict()
         # resume training, including model weight, opt, steps
         if self.cfg.train.resume and os.path.exists(os.path.join(self.cfg.output_dir, 'model.tar')):
-            checkpoint = torch.load(os.path.join(self.cfg.output_dir, 'model.tar'))
+            checkpoint = _safe_torch_load(os.path.join(self.cfg.output_dir, 'model.tar'), map_location=self.device)
             for key in model_dict.keys():
                 if key in checkpoint.keys():
                     util.copy_state_dict(model_dict[key], checkpoint[key])
@@ -89,7 +108,7 @@ class Trainer(object):
             logger.info(f"training start from step {self.global_step}")
         # load model weights only
         elif os.path.exists(self.cfg.pretrained_modelpath):
-            checkpoint = torch.load(self.cfg.pretrained_modelpath)
+            checkpoint = _safe_torch_load(self.cfg.pretrained_modelpath, map_location=self.device)
             for key in model_dict.keys():
                 if key in checkpoint.keys():
                     util.copy_state_dict(model_dict[key], checkpoint[key])
